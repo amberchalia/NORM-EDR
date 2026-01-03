@@ -196,6 +196,11 @@ BOOLEAN alpha(_In_ PCUNICODE_STRING image_path, _Out_ PPE_INFO pe_info) {
         0
     );
 
+    if (!NT_SUCCESS(status)) {
+        log("ZwCreateFile failed %X\n", status);
+        return FALSE;
+    }
+
     status = ZwReadFile(
         file,
         NULL,
