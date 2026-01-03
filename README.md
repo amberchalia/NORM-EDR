@@ -51,9 +51,19 @@ Do not deploy on real systems.
 
 ---
 
-## Support
-Enjoying this project? Want to fuel more late-night coding sessions and in-depth blog posts? Support my work by buying me a coffee! ☕  
+## ☕ Support
+
+If you find this project useful and want to support continued development, 
+you can help by buying me a coffee.
+
+Your support helps cover:
+- Lab infrastructure and VM crashes
+- Kernel debugging time
+- Writing documentation and blog posts
+- Creating educational YouTube content
+
 👉 [**Support me on Buy Me a Coffee**](https://buymeacoffee.com/amberchalia)
+
 
 ## Learn More
 Read about my challenges and technical insights on my blog: [rootfu.in](https://rootfu.in).
