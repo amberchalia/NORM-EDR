@@ -1,0 +1,13 @@
+.vscode/
+.vs/
+x64/
+x86/
+Debug/
+Release/
+*.sys
+*.pdb
+*.obj
+*.log
+*.tlog
+*.user
+*.db
