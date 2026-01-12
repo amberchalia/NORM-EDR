@@ -2,27 +2,13 @@
 #include <ntddk.h>
 #include <ntimage.h>
 
-/*
- * Centralized logging macro.
- * Using INFO level because this is an observational / telemetry driver,
- * not an enforcement component yet.
- */
 #define log(fmt, ...) \
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, fmt, __VA_ARGS__)
 
-/*
- * Configuration limits.
- * These bounds keep the prototype simple and predictable.
- */
-#define max_slot 128          // Maximum number of tracked processes
-#define max_dll 128           // Maximum static DLLs per process
-#define max_dll_name 128      // Maximum DLL name length
+#define max_slot 128
+#define max_dll 128
+#define max_dll_name 128
 
-/*
- * Baseline DLLs:
- * These are common OS / runtime libraries that are expected to load dynamically.
- * We suppress alerts for these to reduce noise.
- */
 const char* base_dll[] =
 {
     "ntdll.dll",
@@ -49,9 +35,6 @@ const char* base_dll[] =
 
 #define base_dll_count (sizeof(base_dll) / sizeof(base_dll[0]))
 
-/*
- * Check whether a DLL belongs to the baseline (noise suppression).
- */
 BOOLEAN is_base_dll(_In_ PCCHAR dll_name) {
     for (ULONG i = 0; i < base_dll_count; i++) {
         if (_stricmp(dll_name, base_dll[i]) == 0)
@@ -60,9 +43,6 @@ BOOLEAN is_base_dll(_In_ PCCHAR dll_name) {
     return FALSE;
 }
 
-/*
- * Undocumented but stable helpers for PE parsing on mapped images.
- */
 EXTERN_C
 PIMAGE_NT_HEADERS
 RtlImageNtHeader(_In_ PVOID base);
@@ -76,29 +56,19 @@ RtlImageDirectoryEntryToData(
     _Out_ PULONG  Size
 );
 
-/*
- * Per-process snapshot.
- * This is the core "entity" that the EDR reasons about.
- */
 typedef struct _PS_SNAP
 {
-    HANDLE  pid;                                   // Process ID
-    BOOLEAN in_use;                                // Slot allocation flag
-    CHAR    static_dll_name[max_dll][max_dll_name];// Static import list
-    ULONG   static_count;                          // Number of static DLLs
-    BOOLEAN static_ready;                          // Static imports parsed
-    BOOLEAN exe_seen;                              // Main EXE image observed
-} ps_snap, *pps_snap;
+    HANDLE pid;
+    BOOLEAN in_use;
+    CHAR static_dll_name[max_dll][max_dll_name];
+    ULONG static_count;
+    BOOLEAN static_ready;
+    BOOLEAN exe_seen;
+}ps_snap, * pps_snap;
 
-/*
- * Global process table.
- * Indexed linearly for simplicity in this prototype.
- */
 ps_snap table[max_slot];
+FAST_MUTEX lock;
 
-/*
- * Allocate a process slot on process creation.
- */
 pps_snap insert(_In_ HANDLE pid) {
     if (!pid)
         return NULL;
@@ -116,13 +86,9 @@ pps_snap insert(_In_ HANDLE pid) {
     return NULL;
 }
 
-/*
- * Free a process slot on process termination.
- */
 void free_mem(_In_ HANDLE pid) {
     if (!pid)
         return;
-
     for (ULONG i = 0; i < max_slot; i++) {
         if (table[i].in_use && table[i].pid == pid) {
             RtlZeroMemory(&table[i], sizeof(ps_snap));
@@ -131,9 +97,6 @@ void free_mem(_In_ HANDLE pid) {
     }
 }
 
-/*
- * Lookup process state by PID.
- */
 pps_snap find_pid(_In_ HANDLE pid) {
     if (!pid)
         return NULL;
@@ -146,26 +109,18 @@ pps_snap find_pid(_In_ HANDLE pid) {
     return NULL;
 }
 
-/*
- * Basic PE metadata extraction from disk.
- * Used for learning / inspection (not enforcement).
- */
 typedef struct _PE_INFO
 {
     USHORT Machine;
     USHORT NumberOfSections;
-    ULONG  AddressOfEntryPoint;
+    ULONG AddressOfEntryPoint;
     USHORT Subsystem;
-    CHAR   section_name[9];
+    CHAR section_name[9];
     BOOLEAN exec;
     BOOLEAN write;
     BOOLEAN ep_in_text;
-} PE_INFO, *PPE_INFO;
+} PE_INFO, * PPE_INFO;
 
-/*
- * Parse PE headers directly from disk to inspect entry point and section flags.
- * This runs during process creation for visibility.
- */
 BOOLEAN alpha(_In_ PCUNICODE_STRING image_path, _Out_ PPE_INFO pe_info) {
     OBJECT_ATTRIBUTES object;
     NTSTATUS status;
@@ -173,6 +128,8 @@ BOOLEAN alpha(_In_ PCUNICODE_STRING image_path, _Out_ PPE_INFO pe_info) {
     IO_STATUS_BLOCK io_status = { 0 };
     UCHAR buffer[1024] = { 0 };
     ULONG bytes = { 0 };
+    BOOLEAN found = FALSE;
+
 
     InitializeObjectAttributes(
         &object,
@@ -196,10 +153,6 @@ BOOLEAN alpha(_In_ PCUNICODE_STRING image_path, _Out_ PPE_INFO pe_info) {
         0
     );
 
-    if (!NT_SUCCESS(status)) {
-        log("ZwCreateFile failed %X\n", status);
-        return FALSE;
-    }
 
     status = ZwReadFile(
         file,
@@ -215,32 +168,81 @@ BOOLEAN alpha(_In_ PCUNICODE_STRING image_path, _Out_ PPE_INFO pe_info) {
 
     ZwClose(file);
 
-    if (!NT_SUCCESS(status))
+    if (!NT_SUCCESS(status)) {
+        log("ZwReadFile failed %X\n", status);
         return FALSE;
+    }
 
     bytes = (ULONG)io_status.Information;
 
-    if (bytes < 2 || buffer[0] != 'M' || buffer[1] != 'Z')
+    if (bytes < 2 || buffer[0] != 'M' || buffer[1] != 'Z') {
+        log("MZ header not found, this is not a binary\n");
         return FALSE;
+    }
 
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)buffer;
+
     PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(buffer + dos->e_lfanew);
 
-    if (nt->Signature != IMAGE_NT_SIGNATURE)
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        log("Invalid Nt header\n");
         return FALSE;
+    }
 
     pe_info->Machine = nt->FileHeader.Machine;
     pe_info->NumberOfSections = nt->FileHeader.NumberOfSections;
     pe_info->Subsystem = nt->OptionalHeader.Subsystem;
     pe_info->AddressOfEntryPoint = nt->OptionalHeader.AddressOfEntryPoint;
 
+    log("Machine: %X\n", pe_info->Machine);
+    log("NumberOfSections: %u\n", pe_info->NumberOfSections);
+    log("Subsystem: %u\n", pe_info->Subsystem);
+    log("AddressOfEntryPoint: %u", pe_info->AddressOfEntryPoint);
+
+    ULONG ep = pe_info->AddressOfEntryPoint;
+
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+
+    for (USHORT i = 0; i < pe_info->NumberOfSections; i++, sec++) {
+        ULONG start = sec->VirtualAddress;
+        ULONG size = sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData;
+
+        if (ep >= start && ep < (start + size)) {
+            found = TRUE;
+            RtlZeroMemory(pe_info->section_name, sizeof(pe_info->section_name));
+            RtlCopyMemory(
+                pe_info->section_name,
+                sec->Name,
+                min((ULONG)8, sizeof(pe_info->section_name) - 1)
+            );
+            pe_info->section_name[8] = '\0'; // ensure null termination
+
+
+            pe_info->exec = (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) ? TRUE : FALSE;
+            pe_info->write = (sec->Characteristics & IMAGE_SCN_MEM_WRITE) ? TRUE : FALSE;
+
+            if (strncmp(pe_info->section_name, ".text", 5) == 0) {
+                pe_info->ep_in_text = TRUE;
+            }
+            else {
+                pe_info->ep_in_text = FALSE;
+            }
+
+            log("EP in section: %s Exce = %d, write = %d\n",
+                pe_info->section_name,
+                pe_info->exec,
+                pe_info->write
+            );
+        }
+    }
+
     return TRUE;
 }
 
-/*
- * Check if a DLL was statically declared by the process.
- */
-BOOLEAN is_static_dll(_In_ pps_snap ps, _In_ PCCHAR dll_name) {
+BOOLEAN is_static(
+    _In_ pps_snap ps,
+    _In_ PCCHAR dll_name
+) {
     for (ULONG i = 0; i < ps->static_count; i++) {
         if (_stricmp(ps->static_dll_name[i], dll_name) == 0)
             return TRUE;
@@ -248,22 +250,19 @@ BOOLEAN is_static_dll(_In_ pps_snap ps, _In_ PCCHAR dll_name) {
     return FALSE;
 }
 
-/*
- * Extract DLL name from a full image path.
- * Normalizes to lowercase for comparison.
- */
 BOOLEAN extract_dll_name(
-    _In_ PUNICODE_STRING full_path,
+    _In_ PUNICODE_STRING path,
     _Out_ CHAR* name,
     _In_ ULONG size
 ) {
-    if (!full_path || !full_path->Buffer || size == 0)
+    if (!path || !path->Buffer || size == 0)
         return FALSE;
 
-    PWCHAR buf = full_path->Buffer;
-    ULONG len = full_path->Length / sizeof(WCHAR);
+    PWCHAR buf = path->Buffer;
+    ULONG len = path->Length / sizeof(WCHAR);
 
     LONG i;
+
     for (i = len - 1; i >= 0; i--) {
         if (buf[i] == L'\\')
             break;
@@ -275,6 +274,7 @@ BOOLEAN extract_dll_name(
     ANSI_STRING as;
 
     RtlInitUnicodeString(&us, dll_name_w);
+
     if (!NT_SUCCESS(RtlUnicodeStringToAnsiString(&as, &us, TRUE)))
         return FALSE;
 
@@ -289,112 +289,142 @@ BOOLEAN extract_dll_name(
     return TRUE;
 }
 
-/*
- * Parse static imports from the main executable image.
- * This establishes the process baseline.
- */
 BOOLEAN alpha_image(_In_ PVOID base, _In_ SIZE_T size, _In_ pps_snap ps) {
     if (!base || size == 0)
-        return FALSE;
-
-    PIMAGE_NT_HEADERS nt = RtlImageNtHeader(base);
-    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE)
-        return FALSE;
-
-    ULONG dir_size = 0;
-    PIMAGE_IMPORT_DESCRIPTOR imp =
-        RtlImageDirectoryEntryToData(
-            base,
-            TRUE,
-            IMAGE_DIRECTORY_ENTRY_IMPORT,
-            &dir_size
-        );
-
-    if (!imp || dir_size == 0)
         return FALSE;
 
     PUCHAR start = (PUCHAR)base;
     PUCHAR end = start + size;
 
+    PIMAGE_NT_HEADERS nt = RtlImageNtHeader(base);
+
+    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE) {
+        log("RtlImageNtHeader is failed\n");
+        return FALSE;
+    }
+
+    ULONG dir_size = 0;
+
+    PIMAGE_IMPORT_DESCRIPTOR imp = RtlImageDirectoryEntryToData(
+        base,
+        TRUE,
+        IMAGE_DIRECTORY_ENTRY_IMPORT,
+        &dir_size
+    );
+
+    if (!imp || dir_size == 0) {
+        log("RtlImageDirectoryEntryToData failed\n");
+        return FALSE;
+    }
+
+    ExAcquireFastMutex(&lock);
     for (; imp->Name && ps->static_count < max_dll; imp++) {
-        PUCHAR dll_name = start + imp->Name;
+        if ((PUCHAR)imp < start || (PUCHAR)imp + sizeof(IMAGE_IMPORT_DESCRIPTOR) > end)
+            break;
+
+        ULONG name_addr = imp->Name;
+
+        if (name_addr == 0)
+            continue;
+
+        PUCHAR dll_name = start + name_addr;
+
         if (dll_name < start || dll_name > end)
             continue;
 
-        strncpy(ps->static_dll_name[ps->static_count],
-                (PCHAR)dll_name,
-                max_dll_name - 1);
+        strncpy(ps->static_dll_name[ps->static_count], (PCHAR)dll_name, max_dll_name - 1);
         ps->static_dll_name[ps->static_count][max_dll_name - 1] = '\0';
         ps->static_count++;
     }
-
     ps->static_ready = TRUE;
     log("NORM: PID: %lu have %lu DLLS\n", ps->pid, ps->static_count);
+    ExReleaseFastMutex(&lock);
     return TRUE;
 }
 
-/*
- * Image load notification.
- * Correlates runtime DLL loads against static baseline.
- */
 void notify_image(
     _In_opt_ PUNICODE_STRING image_name,
     _In_ HANDLE process_id,
     _In_ PIMAGE_INFO image_info
 ) {
+
+
     if (image_info->SystemModeImage)
         return;
 
-    pps_snap ps = find_pid(process_id);
-    if (!ps)
-        return;
+    ExAcquireFastMutex(&lock);
 
-    /* First user-mode image = main EXE */
-    if (!ps->exe_seen) {
-        ps->exe_seen = TRUE;
-        alpha_image(image_info->ImageBase, image_info->ImageSize, ps);
+    pps_snap ps = find_pid(process_id);
+    if (!ps) {
+        ExReleaseFastMutex(&lock);
         return;
     }
 
-    if (!ps->static_ready)
+    BOOLEAN parse = FALSE;
+
+    if (!ps->exe_seen) {
+        ps->exe_seen = TRUE;
+        parse = TRUE;
+    }
+
+    ExReleaseFastMutex(&lock);
+
+    if (parse) {
+        alpha_image(image_info->ImageBase, image_info->ImageSize, ps);
+        log("================================================\n");
         return;
+    }
 
     CHAR dll_name[max_dll_name] = { 0 };
+
     if (!extract_dll_name(image_name, dll_name, sizeof(dll_name)))
         return;
 
-    if (!is_static_dll(ps, dll_name) && !is_base_dll(dll_name)) {
-        log("[ALERT] PID: %lu loaded UNDECLARED DLL: %s\n",
-            process_id, dll_name);
+    ExAcquireFastMutex(&lock);
+
+    if (!ps->static_ready) {
+        ExReleaseFastMutex(&lock);
+        return;
     }
+
+    if (!is_static(ps, dll_name) && !is_base_dll(dll_name)) {
+        log("[ALERT] PID: %lu loaded non defined DLL: %s\n", process_id, dll_name);
+    }
+    ExReleaseFastMutex(&lock);
 }
 
-/*
- * Process lifecycle notification.
- * Allocates and frees per-process state.
- */
 void notify(
     _In_ PEPROCESS process,
     _In_ HANDLE process_id,
     _In_opt_ PPS_CREATE_NOTIFY_INFO info
 ) {
     UNREFERENCED_PARAMETER(process);
+    PE_INFO pe_info;
+    pps_snap ps;
 
     if (info) {
+
         log("\n================ PROCESS CREATE ================\n");
+
         if (info->ImageFileName && info->ImageFileName->Buffer) {
             log("PID: %lu\nImage: %wZ\n", process_id, info->ImageFileName);
+            alpha(info->ImageFileName, &pe_info);
         }
-        insert(process_id);
-    } else {
+        else {
+            log("PID: %lu\nImage: <Unknown>\n", process_id);
+        }
+        ps = insert(process_id);
+
+    }
+    else {
+
         log("\n================ PROCESS EXIT ==================\n");
+        log("PID: %lu TERMINATED\n", process_id);
         free_mem(process_id);
+        log("================================================\n");
     }
 }
 
-/*
- * Driver unload routine.
- */
 void unload(IN PDRIVER_OBJECT driver_object)
 {
     UNREFERENCED_PARAMETER(driver_object);
@@ -403,19 +433,24 @@ void unload(IN PDRIVER_OBJECT driver_object)
     log("NORM: UNLOADED SUCCESSFULLY!");
 }
 
-/*
- * Driver entry point.
- */
 NTSTATUS DriverEntry(IN PDRIVER_OBJECT driver_object, IN PUNICODE_STRING rs)
 {
     UNREFERENCED_PARAMETER(rs);
-
     RtlZeroMemory(&table, sizeof(table));
-
-    PsSetCreateProcessNotifyRoutineEx(notify, FALSE);
-    PsSetLoadImageNotifyRoutine(notify_image);
-
+    ExInitializeFastMutex(&lock);
+    NTSTATUS status;
+    status = PsSetCreateProcessNotifyRoutineEx(notify, FALSE);
+    if (!NT_SUCCESS(status)) {
+        log("PsSetCreateProcessNotifyRoutineEx failed %X\n", status);
+        return status;
+    }
+    status = PsSetLoadImageNotifyRoutine(notify_image);
+    if (!NT_SUCCESS(status)) {
+        log("PsSetLoadImageNotifyRoutine failed %X\n", status);
+        return status;
+    }
     driver_object->DriverUnload = unload;
+
     log("NORM: LOADED SUCCESSFULLY!");
     return STATUS_SUCCESS;
 }
