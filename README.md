@@ -3,23 +3,59 @@
 **NORM (Normal EDR)** is an experimental **kernel-mode EDR research project**
 focused on **explainable detection** rather than silent blocking.
 
-Instead of assigning scores or killing processes, NORM shows:
-> **_why a binary looks suspicious_**
+Instead of assigning scores or killing processes, NORM answers one question:
 
-This project is built step-by-step in public as a learning and research journey.
+> **Why does this binary look suspicious?**
+
+This project is built **step-by-step in public** as a learning and research journey
+into how modern EDRs reason about behavior.
 
 ---
 
-## 🎯 What NORM Currently Detects (v0.1)
+## 🎯 What NORM Currently Detects (v0.2)
 
-- Process creation tracking (kernel)
-- Static DLL imports (PE Import Table)
+### Process & Image Tracking (Kernel)
+- Kernel-level process creation and termination tracking
+- Kernel image load notifications (EXE + DLL)
+- Accurate PID lifecycle correlation
+
+### Static vs Dynamic DLL Analysis
+- Static DLL imports via PE Import Table
 - Runtime / dynamically loaded DLLs
-- Correlation between:
-  - Declared (static) imports
-  - Undeclared (dynamic) DLL loads
+- Detection of **undeclared DLL loads**
 - Baseline suppression for common Windows DLLs
-- Clear, human-readable kernel alerts explaining the signal
+
+### Mode-Based Monitoring (New in v0.2)
+NORM now supports **two execution modes**:
+
+#### 🔹 Single-Binary Mode (default)
+- Monitor **only one target binary**
+- Ideal for:
+  - Malware analysis
+  - Red team payload inspection
+  - Lab research
+- Reduces noise and avoids “Christmas-tree” alerts
+
+#### 🔹 Global Mode
+- Monitor **all processes system-wide**
+- Useful for:
+  - Research
+  - Signal exploration
+  - Understanding system-wide behavior
+
+Switching modes requires **changing a single enum value at compile time**.
+
+---
+
+## 🧠 What Makes NORM Different
+
+- No scoring engine
+- No silent blocking
+- No opaque decisions
+
+Instead, NORM produces **clear, human-readable kernel alerts** such as:
+
+
 
 ## 🔧 Build & Lab Setup
 
